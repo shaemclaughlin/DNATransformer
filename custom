@@ -9,6 +9,7 @@ import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset, Dataset, SubsetRandomSampler
 from sklearn.metrics import accuracy_score
 import matplotlib.pyplot as plt
@@ -23,7 +24,8 @@ import linecache
 import requests
 import math
 
-torch.cuda.is_available()
+# Set the device to CPU or GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Set the random seed for reproducibility
 torch.manual_seed(10)
@@ -31,16 +33,13 @@ np.random.seed(10)
 random.seed(10)
 torch.cuda.manual_seed_all(10)
 
-# Set the device to CPU or GPU
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 # Login to wandb for tracking
 wandb.login()
 
-!wget https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_45/GRCh38.primary_assembly.genome.fa.gz
+#!wget https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_45/GRCh38.primary_assembly.genome.fa.gz
 
 # Define function to preprocess the raw fasta file
-def preprocess_dna_sequence(sequence, chunk_size=1024):
+def preprocess_dna_sequence(sequence, chunk_size=512):
     # Remove unwanted characters and convert to uppercase
     sequence = re.sub(r"[^ACGT]", "", sequence.upper())
     chunks = [sequence[i:i+chunk_size] for i in range(0, len(sequence), chunk_size)]
@@ -64,18 +63,28 @@ with open(sequence_file, "w") as file:
     for sequence in tqdm(sequences, desc="Writing sequences"):
         file.write(sequence + "\n") # New line for each sequence
 
-# Write the first 100 sequences to a new text file
-output_file = "samplesequences.txt"
-with open(sequence_file, "r") as input_file, open(output_file, "w") as output_file:
-    for i, line in enumerate(input_file):
-        if i >= 100000:
-            break
-        output_file.write(line)
+with open(sequence_file, "r") as file:
+    num_lines = sum(1 for _ in file)
+print(num_lines)
+
+train_ratio = 0.9
+train_lines = int(train_ratio * num_lines)
+print(train_lines)
+val_lines = num_lines - train_lines
+print(val_lines)
+
+chars = sorted(list(set('ACGT')))
+vocab_size = len(chars)
+stoi = {ch: i for i, ch in enumerate(chars)}
+itos = {i: ch for i, ch in enumerate(chars)}
+
+encode = lambda s: [stoi[c] for c in s]
+decode = lambda l: ''.join([itos[i] for i in l])
 
 # hyperparameters
-batch_size = 32 # how many independent sequences will we process in parallel?
-block_size = 1024 # what is the maximum context length for predictions?
-max_iters = 5000
+batch_size = 64 # how many independent sequences will we process in parallel?
+block_size = 512 # what is the maximum context length for predictions?
+max_iters = 10000
 eval_interval = 100
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -85,37 +94,54 @@ n_head = 4
 n_layer = 4
 dropout = 0.0
 
-torch.manual_seed(1337)
-
-with open('samplesequences.txt', 'r') as f:
-    text = f.read()
-
-# here are all the unique characters that occur in this text
-chars = sorted(list(set(text)))
-vocab_size = len(chars)
-# create a mapping from characters to integers
-stoi = { ch:i for i,ch in enumerate(chars) }
-itos = { i:ch for i,ch in enumerate(chars) }
-encode = lambda s: [stoi[c] for c in s] # encoder: take a string, output a list of integers
-decode = lambda l: ''.join([itos[i] for i in l]) # decoder: take a list of integers, output a string
-
-# Train and test splits
-data = torch.tensor(encode(text), dtype=torch.long)
-n = int(0.9*len(data)) # first 90% will be train, rest val
-train_data = data[:n]
-val_data = data[n:]
-
-# data loading
 def get_batch(split):
-    # generate a small batch of data of inputs x and targets y
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix])
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+    # Generate a small batch of data of inputs x and targets y
+    if split == 'train':
+        start_line = torch.randint(train_lines, (1,)).item()
+        end_line = min(start_line + batch_size, train_lines)
+    else:
+        start_line = train_lines + torch.randint(val_lines, (1,)).item()
+        end_line = min(start_line + batch_size, num_lines)
+
+    with open(sequence_file, "r") as file:
+        # Move the file pointer to the starting line
+        for _ in range(start_line):
+            file.readline()
+
+        # Read the required number of lines
+        lines = [file.readline().strip() for _ in range(end_line - start_line)]
+
+    # Encode the lines
+    encoded_lines = [encode(line) for line in lines]
+    
+    # Pad sequences shorter than block_size
+    padded_lines = [line + [0] * (block_size - len(line)) for line in encoded_lines]
+
+    # Create input data tensor x
+    x = torch.tensor(padded_lines, dtype=torch.long)
+
+    # Create target data tensor y by shifting the input data by 1
+    y = x.clone()
+    y[:, :-1] = x[:, 1:]
+
     x, y = x.to(device), y.to(device)
     return x, y
 
-# decorator disables gradient computation during the execution of the estimate_loss() function to reduce memory usage
+# Test the get_batch function
+xb, yb = get_batch('train')
+print("Train batch:")
+print(xb.shape)
+print(xb)
+print(yb.shape)
+print(yb)
+
+xb, yb = get_batch('val')
+print("Validation batch:")
+print(xb.shape)
+print(xb)
+print(yb.shape)
+print(yb)
+
 @torch.no_grad()
 def estimate_loss():
     # initialize empty dictionary called out to store evaluation results
@@ -123,7 +149,7 @@ def estimate_loss():
     # sets model to evaluation mode to ensure that any layers that behave different during training and eval use eval behavior
     model.eval()
     # loop iterates over two dataset splits: 'train' and 'val'
-    for split in ['train', 'val']:
+    for split in ['val']:
         # creates tensor losses of shape (eval_iters,) filled with zeros
         losses = torch.zeros(eval_iters)
         accs = torch.zeros(eval_iters)
@@ -246,8 +272,6 @@ class Block(nn.Module):
         #returns output tensor 
         return x
 
-from torch.nn import functional as F
-
 # simple model
 class GenomicLanguageModel(nn.Module):
 
@@ -316,27 +340,29 @@ class GenomicLanguageModel(nn.Module):
 model = GenomicLanguageModel()
 m = model.to(device)
 # print the number of parameters in the model
-print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
+#print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
 # create a PyTorch optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
 # Initialize wandb to log loss and accuracy
-wandb.init(project='genome-transformer', name='model_gpt')
+wandb.init(project='genome-transformer', name='model_light')
 
+# Training
 for iter in tqdm(range(max_iters)):
 
     # every once in a while evaluate the loss on train and val sets
     if iter % eval_interval == 0 or iter == max_iters - 1:
         metrics = estimate_loss()
         wandb.log({
-            "train_loss": metrics['train']['loss'],
-            "train_acc": metrics['train']['acc'],
             "val_loss": metrics['val']['loss'],
             "val_acc": metrics['val']['acc']
         }, step=iter)
         #print(f"step {iter}: train loss {metrics['train']['loss']:.4f}, train acc {metrics['train']['acc']:.4f}, val loss {metrics['val']['loss']:.4f}, val acc {metrics['val']['acc']:.4f}")
     # sample a batch of data
+    
+    model.train()
+    
     xb, yb = get_batch('train')
 
     # evaluate the loss
@@ -344,3 +370,32 @@ for iter in tqdm(range(max_iters)):
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
+    
+    # Calculate accuracy using targets
+    targs = yb.view(-1) # Flatten targets
+    preds = torch.argmax(logits, dim=-1)
+    acc = (preds == targs).float().mean()
+    
+    if iter % 10 == 0:
+        wandb.log({"train_loss": loss.item(), "train_accuracy": acc.item()}, step=iter)
+
+# Test
+test_metrics = {}
+model.eval()
+for split in ['test']:
+    losses = torch.zeros(test_iters)
+    accs = torch.zeros(test_iters)
+    for k in range(test_iters):
+        xb, yb = get_batch(split)
+        logits, loss = model(xb, yb)
+        losses[k] = loss.item()
+
+        targs = yb.view(-1) 
+        preds = torch.argmax(logits, dim=-1)
+        acc = (preds == targs).float().mean()
+        accs[k] = acc.item()
+    test_metrics[split] = {
+        'test_loss': losses.mean(),
+        'test_acc': accs.mean()
+    }
+print(f"Test Loss: {test_metrics['test']['test_loss']}, Test Accuracy: {test_metrics['test']['test_acc'}"]
